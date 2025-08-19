@@ -3,35 +3,10 @@
 import cv2
 import numpy as np
 import pytesseract
-import json
 import csv
 import argparse
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass, asdict
-
-
-@dataclass
-class Cell:
-    row: int
-    col: int
-    x: int
-    y: int
-    width: int
-    height: int
-    text: str
-    confidence: float
-
-
-@dataclass
-class Table:
-    cells: List[Cell]
-    rows: int
-    cols: int
-    x: int
-    y: int
-    width: int
-    height: int
+from typing import List, Tuple, Optional
 
 
 class TableRecognizer:
@@ -40,121 +15,210 @@ class TableRecognizer:
         
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-        
-        _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         return binary
     
-    def detect_lines(self, binary_image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        kernel_length = np.array(binary_image).shape[1] // 80
+    def find_table_region(self, binary: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        """Find the main table region in the image, excluding window borders"""
+        h, w = binary.shape
         
-        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_length, 1))
-        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_length))
+        # Find horizontal and vertical lines
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (w // 5, 1))
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, h // 5))
         
-        horizontal_lines = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
-        vertical_lines = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+        horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+        vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
         
-        return horizontal_lines, vertical_lines
-    
-    def find_table_regions(self, image: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        binary = self.preprocess_image(image)
+        # Combine lines to find table structure
+        table_structure = cv2.add(horizontal_lines, vertical_lines)
         
-        horizontal_lines, vertical_lines = self.detect_lines(binary)
+        # Find contours
+        contours, _ = cv2.findContours(table_structure, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         
-        table_mask = cv2.add(horizontal_lines, vertical_lines)
-        
-        contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        tables = []
-        min_table_area = 5000
+        # Find rectangular contours that look like tables
+        candidates = []
         
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area > min_table_area:
-                x, y, w, h = cv2.boundingRect(contour)
-                tables.append((x, y, w, h))
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # Skip if too close to image edges (likely window border)
+            if x < 10 and y < 10 and x + w > binary.shape[1] - 10 and y + h > binary.shape[0] - 10:
+                continue
+            
+            # Filter based on size and shape
+            if area > 3000 and w > 100 and h > 50:
+                # Check aspect ratio (tables are usually wider than tall)
+                aspect_ratio = w / h
+                if 0.5 < aspect_ratio < 10:
+                    candidates.append((x, y, w, h, area))
         
-        return tables
+        # Choose the best candidate (not necessarily the largest)
+        if candidates:
+            # Sort by distance from center and area
+            center_x, center_y = w // 2, h // 2
+            candidates.sort(key=lambda c: abs(c[0] + c[2]//2 - center_x) + abs(c[1] + c[3]//2 - center_y))
+            
+            # Return the most centered large contour
+            for x, y, w, h, area in candidates:
+                if area > max(3000, binary.shape[0] * binary.shape[1] * 0.05):
+                    return (x, y, w, h)
+            
+            # If no good centered one, return the largest
+            candidates.sort(key=lambda c: c[4], reverse=True)
+            return candidates[0][:4]
+        
+        return None
     
-    def extract_cells(self, image: np.ndarray, table_region: Tuple[int, int, int, int]) -> List[Cell]:
-        x, y, w, h = table_region
-        table_img = image[y:y+h, x:x+w]
+    def detect_table_lines(self, binary: np.ndarray, region: Optional[Tuple[int, int, int, int]] = None) -> Tuple[List, List]:
+        h, w = binary.shape
         
-        gray = cv2.cvtColor(table_img, cv2.COLOR_BGR2GRAY)
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # Don't crop if no good region found - work with full image
+        x, y = 0, 0
         
-        horizontal_lines, vertical_lines = self.detect_lines(cv2.bitwise_not(binary))
+        # Detect lines with morphology - use smaller kernel for better line detection
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (w // 8, 1))
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, h // 8))
         
-        combined = cv2.add(horizontal_lines, vertical_lines)
+        horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+        vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
         
-        contours, _ = cv2.findContours(combined, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        # Find line positions with lower threshold for better detection
+        h_lines = []
+        for row in range(h):
+            if np.sum(horizontal_lines[row, :]) > w * 255 * 0.2:
+                h_lines.append(row)
         
-        cells = []
-        min_cell_area = 100
+        v_lines = []
+        for col in range(w):
+            if np.sum(vertical_lines[:, col]) > h * 255 * 0.2:
+                v_lines.append(col)
         
-        cell_boxes = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area > min_cell_area:
-                cell_x, cell_y, cell_w, cell_h = cv2.boundingRect(contour)
-                if cell_w > 10 and cell_h > 10:
-                    cell_boxes.append((cell_x, cell_y, cell_w, cell_h))
+        # Merge close lines
+        h_lines = self.merge_close_lines(h_lines, threshold=8)
+        v_lines = self.merge_close_lines(v_lines, threshold=8)
         
-        cell_boxes = sorted(cell_boxes, key=lambda b: (b[1], b[0]))
+        # Filter lines that are likely table boundaries
+        # Remove lines too close to edges if we have interior lines
+        if len(h_lines) > 6:
+            h_lines = [hline for hline in h_lines if 20 < hline < h - 20]
+        if len(v_lines) > 5:
+            v_lines = [vline for vline in v_lines if 20 < vline < w - 20]
         
-        if not cell_boxes:
-            return cells
+        return h_lines, v_lines
+    
+    def merge_close_lines(self, lines: List[int], threshold: int = 10) -> List[int]:
+        if not lines:
+            return []
+        
+        lines = sorted(lines)
+        merged = [lines[0]]
+        for line in lines[1:]:
+            if line - merged[-1] > threshold:
+                merged.append(line)
+        return merged
+    
+    def extract_cells_from_grid(self, image: np.ndarray, h_lines: List[int], v_lines: List[int]) -> List[List[str]]:
+        if len(h_lines) < 2 or len(v_lines) < 2:
+            return []
         
         rows = []
-        current_row = []
-        current_y = cell_boxes[0][1]
-        y_threshold = 10
-        
-        for box in cell_boxes:
-            if abs(box[1] - current_y) > y_threshold:
-                if current_row:
-                    rows.append(sorted(current_row, key=lambda b: b[0]))
-                current_row = [box]
-                current_y = box[1]
-            else:
-                current_row.append(box)
-        
-        if current_row:
-            rows.append(sorted(current_row, key=lambda b: b[0]))
-        
-        for row_idx, row in enumerate(rows):
-            for col_idx, (cell_x, cell_y, cell_w, cell_h) in enumerate(row):
-                cell_img = table_img[cell_y:cell_y+cell_h, cell_x:cell_x+cell_w]
+        for i in range(len(h_lines) - 1):
+            row = []
+            for j in range(len(v_lines) - 1):
+                y1, y2 = h_lines[i], h_lines[i + 1]
+                x1, x2 = v_lines[j], v_lines[j + 1]
                 
-                text = self.extract_text_from_cell(cell_img)
+                # Add small margin
+                margin = 3
+                y1 = max(0, y1 + margin)
+                y2 = min(image.shape[0], y2 - margin)
+                x1 = max(0, x1 + margin)
+                x2 = min(image.shape[1], x2 - margin)
                 
-                cell = Cell(
-                    row=row_idx,
-                    col=col_idx,
-                    x=x + cell_x,
-                    y=y + cell_y,
-                    width=cell_w,
-                    height=cell_h,
-                    text=text,
-                    confidence=0.9
-                )
-                cells.append(cell)
+                if y2 > y1 and x2 > x1:
+                    cell_img = image[y1:y2, x1:x2]
+                    text = self.extract_text_from_cell(cell_img)
+                    row.append(text)
+                else:
+                    row.append("")
+            
+            # Only keep rows with content
+            if any(cell.strip() for cell in row):
+                rows.append(row)
         
-        return cells
+        return rows
     
     def extract_text_from_cell(self, cell_image: np.ndarray) -> str:
         try:
-            padding = 10
+            if len(cell_image.shape) == 3:
+                gray = cv2.cvtColor(cell_image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = cell_image
+            
+            # Resize if too small
+            if gray.shape[0] < 20 or gray.shape[1] < 20:
+                scale = max(30 / gray.shape[0], 30 / gray.shape[1])
+                new_h = int(gray.shape[0] * scale)
+                new_w = int(gray.shape[1] * scale)
+                gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            
+            # Apply denoising
+            denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+            
+            # Threshold
+            _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Check if we need to invert (text should be white on black for tesseract)
+            white_pixels = np.sum(binary == 255)
+            total_pixels = binary.shape[0] * binary.shape[1]
+            if white_pixels > total_pixels * 0.5:
+                binary = cv2.bitwise_not(binary)
+            
+            # Morphological operations to clean up
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            
+            # Add padding
+            padding = 15
             padded = cv2.copyMakeBorder(
-                cell_image, padding, padding, padding, padding,
-                cv2.BORDER_CONSTANT, value=[255, 255, 255]
+                binary, padding, padding, padding, padding,
+                cv2.BORDER_CONSTANT, value=[0, 0, 0]
             )
             
-            text = pytesseract.image_to_string(padded, config='--psm 6').strip()
+            # Try different OCR modes
+            configs = [
+                r'--oem 3 --psm 7',  # Single text line
+                r'--oem 3 --psm 8',  # Single word
+                r'--oem 3 --psm 6',  # Uniform block
+            ]
             
+            best_text = ""
+            best_conf = 0
+            
+            for config in configs:
+                try:
+                    data = pytesseract.image_to_data(padded, config=config, output_type=pytesseract.Output.DICT)
+                    for i, conf in enumerate(data['conf']):
+                        if int(conf) > best_conf and data['text'][i].strip():
+                            best_text = data['text'][i]
+                            best_conf = int(conf)
+                except:
+                    pass
+            
+            if not best_text:
+                # Fallback to simple OCR
+                text = pytesseract.image_to_string(padded, config=configs[0]).strip()
+            else:
+                text = best_text
+            
+            # Clean text
             text = ' '.join(text.split())
+            
+            # Remove artifacts
+            import re
+            text = re.sub(r'[|\[\]{}\\/_«»]', '', text)
+            text = text.strip()
             
             return text
         except Exception as e:
@@ -162,92 +226,79 @@ class TableRecognizer:
                 print(f"Error extracting text: {e}")
             return ""
     
-    def recognize_tables(self, image_path: str) -> List[Table]:
+    def recognize_table(self, image_path: str) -> List[List[str]]:
         image = cv2.imread(image_path)
         if image is None:
             raise ValueError(f"Could not load image from {image_path}")
         
-        table_regions = self.find_table_regions(image)
+        binary = self.preprocess_image(image)
         
-        tables = []
-        for region in table_regions:
-            cells = self.extract_cells(image, region)
+        # Try to find table region first
+        region = self.find_table_region(binary)
+        
+        if self.debug_mode and region:
+            print(f"Found table region at: x={region[0]}, y={region[1]}, w={region[2]}, h={region[3]}")
+        
+        # Detect lines
+        h_lines, v_lines = self.detect_table_lines(binary, region)
+        
+        if self.debug_mode:
+            print(f"Detected {len(h_lines)} horizontal lines and {len(v_lines)} vertical lines")
             
-            if cells:
-                max_row = max(cell.row for cell in cells)
-                max_col = max(cell.col for cell in cells)
-                
-                table = Table(
-                    cells=cells,
-                    rows=max_row + 1,
-                    cols=max_col + 1,
-                    x=region[0],
-                    y=region[1],
-                    width=region[2],
-                    height=region[3]
-                )
-                tables.append(table)
+            if self.debug_mode and len(h_lines) > 0 and len(v_lines) > 0:
+                # Save debug visualization
+                vis_image = image.copy()
+                for h in h_lines:
+                    cv2.line(vis_image, (0, h), (image.shape[1], h), (0, 255, 0), 2)
+                for v in v_lines:
+                    cv2.line(vis_image, (v, 0), (v, image.shape[0]), (255, 0, 0), 2)
+                cv2.imwrite("debug_lines.png", vis_image)
+                print("Debug visualization saved to debug_lines.png")
         
-        if self.debug_mode and tables:
-            self.visualize_tables(image, tables)
+        # Extract cells
+        table_data = self.extract_cells_from_grid(image, h_lines, v_lines)
         
-        return tables
+        # Post-process to clean up data
+        table_data = self.clean_table_data(table_data)
+        
+        return table_data
     
-    def visualize_tables(self, image: np.ndarray, tables: List[Table]):
-        vis_image = image.copy()
+    def clean_table_data(self, table_data: List[List[str]]) -> List[List[str]]:
+        """Remove empty rows/columns and clean up the data"""
+        if not table_data:
+            return table_data
         
-        for table in tables:
-            cv2.rectangle(vis_image, (table.x, table.y), 
-                         (table.x + table.width, table.y + table.height), 
-                         (0, 255, 0), 2)
+        # Remove empty rows
+        cleaned = []
+        for row in table_data:
+            if any(cell.strip() for cell in row):
+                cleaned.append(row)
+        
+        # Remove empty columns if all cells in column are empty
+        if cleaned:
+            num_cols = len(cleaned[0])
+            cols_to_keep = []
+            for col_idx in range(num_cols):
+                if any(row[col_idx].strip() for row in cleaned if col_idx < len(row)):
+                    cols_to_keep.append(col_idx)
             
-            for cell in table.cells:
-                cv2.rectangle(vis_image, (cell.x, cell.y),
-                             (cell.x + cell.width, cell.y + cell.height),
-                             (255, 0, 0), 1)
+            if cols_to_keep:
+                cleaned = [[row[i] if i < len(row) else "" for i in cols_to_keep] for row in cleaned]
         
-        cv2.imwrite("debug_output.png", vis_image)
-        print("Debug visualization saved to debug_output.png")
+        return cleaned
 
 
-def export_to_json(tables: List[Table], output_path: str):
-    data = []
-    for idx, table in enumerate(tables):
-        table_data = {
-            "table_id": idx,
-            "dimensions": {"rows": table.rows, "cols": table.cols},
-            "position": {"x": table.x, "y": table.y, "width": table.width, "height": table.height},
-            "cells": [asdict(cell) for cell in table.cells]
-        }
-        data.append(table_data)
-    
-    with open(output_path, 'w') as f:
-        json.dump(data, f, indent=2)
-
-
-def export_to_csv(tables: List[Table], output_path: str):
-    for idx, table in enumerate(tables):
-        grid = [['' for _ in range(table.cols)] for _ in range(table.rows)]
-        
-        for cell in table.cells:
-            if cell.row < table.rows and cell.col < table.cols:
-                grid[cell.row][cell.col] = cell.text
-        
-        csv_path = output_path.replace('.csv', f'_table_{idx}.csv')
-        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerows(grid)
-        
-        print(f"Table {idx} saved to {csv_path}")
+def export_to_csv(table_data: List[List[str]], output_path: str):
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerows(table_data)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Recognize tables in UI screenshots')
-    parser.add_argument('image', help='Path to the screenshot image')
-    parser.add_argument('-o', '--output', default='output', help='Output file name (without extension)')
-    parser.add_argument('-f', '--format', choices=['json', 'csv', 'both'], default='json',
-                       help='Output format')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode with visualization')
+    parser = argparse.ArgumentParser(description='Recognize tables in images and export to CSV')
+    parser.add_argument('image', help='Path to the image containing a table')
+    parser.add_argument('-o', '--output', default='output.csv', help='Output CSV file path')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     
     args = parser.parse_args()
     
@@ -259,29 +310,28 @@ def main():
     
     try:
         print(f"Processing image: {args.image}")
-        tables = recognizer.recognize_tables(args.image)
+        table_data = recognizer.recognize_table(args.image)
         
-        if not tables:
-            print("No tables detected in the image")
+        if not table_data:
+            print("No table detected in the image")
             return 0
         
-        print(f"Detected {len(tables)} table(s)")
+        print(f"Detected table with {len(table_data)} rows and {len(table_data[0]) if table_data else 0} columns")
         
-        if args.format in ['json', 'both']:
-            json_path = f"{args.output}.json"
-            export_to_json(tables, json_path)
-            print(f"JSON output saved to {json_path}")
+        export_to_csv(table_data, args.output)
+        print(f"CSV saved to {args.output}")
         
-        if args.format in ['csv', 'both']:
-            export_to_csv(tables, args.output + '.csv')
-        
-        for idx, table in enumerate(tables):
-            print(f"\nTable {idx}:")
-            print(f"  Dimensions: {table.rows} rows x {table.cols} columns")
-            print(f"  Total cells: {len(table.cells)}")
+        print("\nTable preview:")
+        for row in table_data[:5]:
+            print(" | ".join(row))
+        if len(table_data) > 5:
+            print("...")
         
     except Exception as e:
         print(f"Error: {e}")
+        if args.debug:
+            import traceback
+            traceback.print_exc()
         return 1
     
     return 0

@@ -1,24 +1,30 @@
 # UI Table Recognition Utility
 
-A Python utility that recognizes and extracts tables from UI screenshots using computer vision and OCR.
+A Python utility that recognizes and extracts tables from UI screenshots using computer vision and OCR, outputting clean CSV data.
 
 ## Features
 
-- Detects tables in UI screenshots automatically
+- Automatic table detection in UI screenshots
 - Extracts text from table cells using OCR
 - Preserves table structure (rows and columns)
-- Exports results in JSON or CSV format
-- Debug mode with visual output
-- Handles various table styles
+- Exports results as CSV format
+- Debug mode with visual line detection output
+- Handles various table styles and window UIs
 
 ## Installation
 
-1. Install Python dependencies:
+1. Create and activate a virtual environment:
+```bash
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+
+2. Install Python dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-2. Install Tesseract OCR:
+3. Install Tesseract OCR:
 - macOS: `brew install tesseract`
 - Ubuntu/Debian: `sudo apt-get install tesseract-ocr`
 - Windows: Download from [GitHub](https://github.com/UB-Mannheim/tesseract/wiki)
@@ -30,45 +36,49 @@ Basic usage:
 python table_recognizer.py screenshot.png
 ```
 
+This will create `output.csv` with the extracted table data.
+
 With options:
 ```bash
-# Export as CSV
-python table_recognizer.py screenshot.png -f csv -o results
+# Specify output file
+python table_recognizer.py screenshot.png -o results.csv
 
-# Export both JSON and CSV
-python table_recognizer.py screenshot.png -f both -o results
-
-# Enable debug mode with visualization
+# Enable debug mode (saves debug_lines.png visualization)
 python table_recognizer.py screenshot.png --debug
 ```
 
 ## Command Line Arguments
 
 - `image`: Path to the screenshot image (required)
-- `-o, --output`: Output file name without extension (default: "output")
-- `-f, --format`: Output format - json, csv, or both (default: "json")
-- `--debug`: Enable debug mode with visualization
+- `-o, --output`: Output CSV file path (default: "output.csv")
+- `--debug`: Enable debug mode with line detection visualization
 
-## Output Formats
+## Output Format
 
-### JSON Format
-Contains structured data with:
-- Table dimensions and position
-- Cell-by-cell information with text and coordinates
-- Confidence scores
+The tool outputs a standard CSV file with the extracted table data. Empty rows and columns are automatically removed.
 
-### CSV Format
-Each table is saved as a separate CSV file with the extracted text arranged in rows and columns.
+Example output:
+```csv
+ID,Name,Status,Value
+001,Item A,Active,100
+002,Item B,Pending,250
+003,Item C,Active,180
+```
 
 ## Example
 
 ```bash
-# Process a screenshot and save as JSON
-python table_recognizer.py ui_screenshot.png -o extracted_tables
+# Process a screenshot and save to custom CSV file
+python table_recognizer.py ui_screenshot.png -o extracted_data.csv
 
 # Process with debug visualization
 python table_recognizer.py ui_screenshot.png --debug
 ```
+
+The debug mode will:
+- Show detected line counts
+- Save `debug_lines.png` with visualization of detected table lines
+- Display table dimensions and preview
 
 ## How It Works
 
