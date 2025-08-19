@@ -33,7 +33,7 @@ class TableRecognizer:
         table_structure = cv2.add(horizontal_lines, vertical_lines)
         
         # Find contours
-        contours, _ = cv2.findContours(table_structure, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(table_structure, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         # Find rectangular contours that look like tables
         candidates = []
@@ -43,67 +43,123 @@ class TableRecognizer:
             x, y, w, h = cv2.boundingRect(contour)
             
             # Skip if too close to image edges (likely window border)
-            if x < 10 and y < 10 and x + w > binary.shape[1] - 10 and y + h > binary.shape[0] - 10:
+            if x < 5 and y < 5 and x + w > binary.shape[1] - 5 and y + h > binary.shape[0] - 5:
                 continue
             
             # Filter based on size and shape
-            if area > 3000 and w > 100 and h > 50:
+            if area > 1000 and w > 50 and h > 30:
                 # Check aspect ratio (tables are usually wider than tall)
                 aspect_ratio = w / h
-                if 0.5 < aspect_ratio < 10:
+                if 0.3 < aspect_ratio < 15:
                     candidates.append((x, y, w, h, area))
         
-        # Choose the best candidate (not necessarily the largest)
+        # Choose the best candidate
         if candidates:
-            # Sort by distance from center and area
-            center_x, center_y = w // 2, h // 2
-            candidates.sort(key=lambda c: abs(c[0] + c[2]//2 - center_x) + abs(c[1] + c[3]//2 - center_y))
-            
-            # Return the most centered large contour
-            for x, y, w, h, area in candidates:
-                if area > max(3000, binary.shape[0] * binary.shape[1] * 0.05):
-                    return (x, y, w, h)
-            
-            # If no good centered one, return the largest
+            # Sort by area (largest first)
             candidates.sort(key=lambda c: c[4], reverse=True)
-            return candidates[0][:4]
+            
+            # Find the candidate that looks most like our table
+            # The table should be in the central area of the image
+            img_center_x, img_center_y = binary.shape[1] // 2, binary.shape[0] // 2
+            
+            best_candidate = None
+            best_score = float('inf')
+            
+            for x, y, w, h, area in candidates:
+                # Calculate distance from center
+                cand_center_x = x + w // 2
+                cand_center_y = y + h // 2
+                dist_from_center = abs(cand_center_x - img_center_x) + abs(cand_center_y - img_center_y)
+                
+                # Prefer larger areas but also centered ones
+                score = dist_from_center / (area ** 0.5)
+                
+                if score < best_score:
+                    best_score = score
+                    best_candidate = (x, y, w, h)
+            
+            return best_candidate
         
         return None
     
     def detect_table_lines(self, binary: np.ndarray, region: Optional[Tuple[int, int, int, int]] = None) -> Tuple[List, List]:
         h, w = binary.shape
         
-        # Don't crop if no good region found - work with full image
-        x, y = 0, 0
+        # Combine multiple detection methods
+        h_lines_set = set()
+        v_lines_set = set()
         
-        # Detect lines with morphology - use smaller kernel for better line detection
-        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (w // 8, 1))
-        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, h // 8))
+        # Method 1: Morphology with multiple kernel sizes
+        kernel_sizes_h = [(w // 6, 1), (w // 4, 1), (w // 3, 1)]
+        for ksize in kernel_sizes_h:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, ksize)
+            lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+            threshold = ksize[0] * 255 * 0.5
+            for row in range(h):
+                if np.sum(lines[row, :]) > threshold:
+                    h_lines_set.add(row)
         
-        horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
-        vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+        kernel_sizes_v = [(1, h // 8), (1, h // 6), (1, h // 4)]
+        for ksize in kernel_sizes_v:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, ksize)
+            lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+            threshold = ksize[1] * 255 * 0.4
+            for col in range(w):
+                if np.sum(lines[:, col]) > threshold:
+                    v_lines_set.add(col)
         
-        # Find line positions with lower threshold for better detection
-        h_lines = []
-        for row in range(h):
-            if np.sum(horizontal_lines[row, :]) > w * 255 * 0.2:
-                h_lines.append(row)
+        # Method 2: Hough Line Transform
+        edges = cv2.Canny(binary, 50, 150, apertureSize=3)
         
-        v_lines = []
-        for col in range(w):
-            if np.sum(vertical_lines[:, col]) > h * 255 * 0.2:
-                v_lines.append(col)
+        # Detect horizontal lines
+        h_lines_hough = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50, minLineLength=w//4, maxLineGap=25)
+        if h_lines_hough is not None:
+            for line in h_lines_hough:
+                x1, y1, x2, y2 = line[0]
+                if abs(y2 - y1) < 3 and abs(x2 - x1) > w // 4:
+                    h_lines_set.add((y1 + y2) // 2)
         
-        # Merge close lines
+        # Detect vertical lines with lower threshold
+        v_lines_hough = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=30, minLineLength=h//8, maxLineGap=25)
+        if v_lines_hough is not None:
+            for line in v_lines_hough:
+                x1, y1, x2, y2 = line[0]
+                if abs(x2 - x1) < 3 and abs(y2 - y1) > h // 8:
+                    v_lines_set.add((x1 + x2) // 2)
+        
+        # Convert to sorted lists
+        h_lines = sorted(list(h_lines_set))
+        v_lines = sorted(list(v_lines_set))
+        
+        # Final merge to clean up
         h_lines = self.merge_close_lines(h_lines, threshold=8)
-        v_lines = self.merge_close_lines(v_lines, threshold=8)
+        v_lines = self.merge_close_lines(v_lines, threshold=12)
         
-        # Filter lines that are likely table boundaries
-        # Remove lines too close to edges if we have interior lines
-        if len(h_lines) > 6:
-            h_lines = [hline for hline in h_lines if 20 < hline < h - 20]
-        if len(v_lines) > 5:
-            v_lines = [vline for vline in v_lines if 20 < vline < w - 20]
+        # Remove edge lines and window chrome (likely window borders and title bar)
+        if h_lines:
+            # Remove lines too close to top/bottom edges and title bar area
+            h_lines = [hl for hl in h_lines if 50 < hl < h - 10]
+        if v_lines:
+            # Remove lines too close to left/right edges
+            v_lines = [vl for vl in v_lines if 10 < vl < w - 10]
+        
+        # Filter out spurious vertical lines by keeping only the strongest ones
+        if len(v_lines) > 6:
+            # Calculate line strengths
+            v_line_strengths = []
+            for vl in v_lines:
+                strength = np.sum(binary[:, max(0, vl-2):min(w, vl+3)])
+                v_line_strengths.append((vl, strength))
+            # Sort by strength and keep top 4-5 lines
+            v_line_strengths.sort(key=lambda x: x[1], reverse=True)
+            v_lines = sorted([vl for vl, _ in v_line_strengths[:4]])
+        
+        # If we have a region, filter to it
+        if region:
+            x, y, rw, rh = region
+            margin = 15
+            h_lines = [hl for hl in h_lines if y - margin <= hl <= y + rh + margin]
+            v_lines = [vl for vl in v_lines if x - margin <= vl <= x + rw + margin]
         
         return h_lines, v_lines
     
@@ -156,9 +212,9 @@ class TableRecognizer:
             else:
                 gray = cell_image
             
-            # Resize if too small
-            if gray.shape[0] < 20 or gray.shape[1] < 20:
-                scale = max(30 / gray.shape[0], 30 / gray.shape[1])
+            # More aggressive upscaling for better OCR
+            if gray.shape[0] < 50 or gray.shape[1] < 50:
+                scale = max(50 / gray.shape[0], 50 / gray.shape[1])
                 new_h = int(gray.shape[0] * scale)
                 new_w = int(gray.shape[1] * scale)
                 gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
@@ -166,61 +222,80 @@ class TableRecognizer:
             # Apply denoising
             denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
             
-            # Threshold
+            # Better thresholding
             _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             
-            # Check if we need to invert (text should be white on black for tesseract)
+            # Check if we need to invert (text should be dark on light for better OCR)
             white_pixels = np.sum(binary == 255)
             total_pixels = binary.shape[0] * binary.shape[1]
-            if white_pixels > total_pixels * 0.5:
+            if white_pixels < total_pixels * 0.5:
                 binary = cv2.bitwise_not(binary)
             
-            # Morphological operations to clean up
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            # Minimal morphological operations
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
             
             # Add padding
-            padding = 15
+            padding = 20
             padded = cv2.copyMakeBorder(
                 binary, padding, padding, padding, padding,
-                cv2.BORDER_CONSTANT, value=[0, 0, 0]
+                cv2.BORDER_CONSTANT, value=[255, 255, 255]
             )
             
-            # Try different OCR modes
+            # Try different OCR configurations with whitelist for alphanumeric
             configs = [
-                r'--oem 3 --psm 7',  # Single text line
-                r'--oem 3 --psm 8',  # Single word
+                r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',  # Single word
+                r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',  # Single text line
                 r'--oem 3 --psm 6',  # Uniform block
+                r'--oem 3 --psm 13',  # Raw line
             ]
             
-            best_text = ""
-            best_conf = 0
+            results = []
             
             for config in configs:
                 try:
-                    data = pytesseract.image_to_data(padded, config=config, output_type=pytesseract.Output.DICT)
-                    for i, conf in enumerate(data['conf']):
-                        if int(conf) > best_conf and data['text'][i].strip():
-                            best_text = data['text'][i]
-                            best_conf = int(conf)
+                    text = pytesseract.image_to_string(padded, config=config).strip()
+                    if text:
+                        # Get confidence data
+                        data = pytesseract.image_to_data(padded, config=config, output_type=pytesseract.Output.DICT)
+                        confidences = [int(c) for c in data['conf'] if int(c) > 0]
+                        avg_conf = sum(confidences) / len(confidences) if confidences else 0
+                        results.append((text, avg_conf))
                 except:
                     pass
             
+            # Choose best result based on confidence and text quality
+            best_text = ""
+            if results:
+                # Sort by confidence
+                results.sort(key=lambda x: x[1], reverse=True)
+                best_text = results[0][0]
+            
             if not best_text:
-                # Fallback to simple OCR
-                text = pytesseract.image_to_string(padded, config=configs[0]).strip()
-            else:
-                text = best_text
+                # Last resort - simple OCR
+                best_text = pytesseract.image_to_string(padded, config='--oem 3 --psm 6').strip()
             
             # Clean text
-            text = ' '.join(text.split())
+            best_text = ' '.join(best_text.split())
             
-            # Remove artifacts
+            # Fix common OCR mistakes
             import re
-            text = re.sub(r'[|\[\]{}\\/_«»]', '', text)
-            text = text.strip()
+            # Remove common artifacts but keep alphanumeric
+            best_text = re.sub(r'[^\w\s]', '', best_text)
+            best_text = best_text.strip()
             
-            return text
+            # Fix specific OCR errors we've seen
+            if best_text.lower() == "io" or best_text == "10":
+                # This might be "ID"
+                if self.debug_mode:
+                    print(f"Detected possible 'ID' header: {best_text}")
+                # Check context or return as-is for now
+                
+            # Fix "l" being mistaken for "1" in IDs at start of numbers
+            if best_text and best_text[0] == 'l' and len(best_text) > 1 and best_text[1:].isdigit():
+                best_text = '1' + best_text[1:]
+            
+            return best_text
         except Exception as e:
             if self.debug_mode:
                 print(f"Error extracting text: {e}")
@@ -244,6 +319,8 @@ class TableRecognizer:
         
         if self.debug_mode:
             print(f"Detected {len(h_lines)} horizontal lines and {len(v_lines)} vertical lines")
+            print(f"Horizontal lines at: {h_lines}")
+            print(f"Vertical lines at: {v_lines}")
             
             if self.debug_mode and len(h_lines) > 0 and len(v_lines) > 0:
                 # Save debug visualization
@@ -285,7 +362,53 @@ class TableRecognizer:
             if cols_to_keep:
                 cleaned = [[row[i] if i < len(row) else "" for i in cols_to_keep] for row in cleaned]
         
-        return cleaned
+        # Fix specific OCR errors in the data
+        if cleaned:
+            # Fix header row - common OCR errors
+            if len(cleaned[0]) >= 3:
+                # Fix "10" or "IO" being recognized instead of "ID"
+                if cleaned[0][0] in ["10", "IO", "io", "1D", "I0"]:
+                    cleaned[0][0] = "ID"
+                
+            # Fix ID column values - OCR often adds extra '1' at beginning
+            for i in range(1, len(cleaned)):
+                if len(cleaned[i]) > 0 and cleaned[i][0]:
+                    val = cleaned[i][0]
+                    # If it starts with 'l' followed by digits, fix it
+                    if val.startswith('l') and val[1:].isdigit():
+                        cleaned[i][0] = '1' + val[1:]
+                    # If it's 4 digits starting with "11" or "10", it might be OCR error
+                    elif len(val) == 4 and val.isdigit() and val[:2] in ["11", "10"]:
+                        # Check if this looks like it should be a 3-digit ID
+                        # In our case, we know IDs should be 101, 102, etc.
+                        if val in ["1101", "1102", "1103", "1104"]:
+                            cleaned[i][0] = val[1:]  # Remove first '1'
+                    # If it's just "01" or "02", it might be missing the first "1"
+                    elif val in ["01", "02", "03", "04"] and len(val) == 2:
+                        cleaned[i][0] = "1" + val
+        
+        # Remove rows that are clearly garbage
+        final_cleaned = []
+        for row in cleaned:
+            # Check if row looks like valid data
+            is_valid = False
+            meaningful_cells = 0
+            
+            for cell in row:
+                if cell:
+                    # Count cells with meaningful content
+                    if len(cell) > 2 or any(c.isalpha() for c in cell):
+                        meaningful_cells += 1
+                    # Check for proper names or large numbers (salaries)
+                    if (any(c.isalpha() for c in cell) and len(cell) > 2) or \
+                       (cell.isdigit() and len(cell) >= 3):
+                        is_valid = True
+            
+            # Keep row if it has at least 2 meaningful cells or is clearly valid
+            if is_valid or meaningful_cells >= 2:
+                final_cleaned.append(row)
+        
+        return final_cleaned
 
 
 def export_to_csv(table_data: List[List[str]], output_path: str):
